@@ -1,0 +1,547 @@
+import asyncio
+import ctypes
+from ctypes import wintypes
+import win32gui
+import win32con
+import os
+import keyboard
+import time
+
+POLL_INTERVAL = 0.05
+ANIMATION_DURATION = 0.2
+ANIMATION_STEPS = 10
+GAP = 10
+CONFIG_FILE = "config.txt"
+
+user32 = ctypes.windll.user32
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+class ACCENTPOLICY(ctypes.Structure):
+    _fields_ = [
+        ("AccentState", ctypes.c_int),
+        ("AccentFlags", ctypes.c_int),
+        ("GradientColor", ctypes.c_int),
+        ("AnimationId", ctypes.c_int),
+    ]
+
+class WINCOMPATTRDATA(ctypes.Structure):
+    _fields_ = [
+        ("Attribute", ctypes.c_int),
+        ("Data", ctypes.c_void_p),
+        ("SizeOfData", ctypes.c_size_t),
+    ]
+
+def rects_intersect(r1, r2):
+    x1, y1, w1, h1 = r1
+    x2, y2, w2, h2 = r2
+    return not (x1 + w1 <= x2 or x2 + w2 <= x1 or y1 + h1 <= y2 or y2 + h2 <= y1)
+
+
+def apply_blur(hwnd):
+    ACCENT_ENABLE_ACRYLICBLURBEHIND = 2
+    WCA_ACCENT_POLICY = 19
+
+    policy = ACCENTPOLICY()
+    policy.AccentState = ACCENT_ENABLE_ACRYLICBLURBEHIND
+    policy.AccentFlags = 2
+    policy.GradientColor = 0x99000000
+
+    data = WINCOMPATTRDATA()
+    data.Attribute = WCA_ACCENT_POLICY
+    data.Data = ctypes.cast(ctypes.pointer(policy), ctypes.c_void_p)
+    data.SizeOfData = ctypes.sizeof(policy)
+
+    fn = user32.SetWindowCompositionAttribute
+    fn.argtypes = [wintypes.HWND, ctypes.POINTER(WINCOMPATTRDATA)]
+    fn.restype = wintypes.BOOL
+
+    fn(hwnd, ctypes.byref(data))
+
+def window_monitor_map(windows, monitors):
+    def intersect(a, b):
+        dx = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+        dy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+        return dx * dy
+
+    mapping = {}
+    for hwnd in windows:
+        try:
+            rect = win32gui.GetWindowRect(hwnd)
+        except:
+            continue
+        best, bi = 0, None
+        for i, m in enumerate(monitors):
+            area = intersect(rect, m)
+            if area > best:
+                best, bi = area, i
+        if bi is not None:
+            mapping.setdefault(bi, []).append(hwnd)
+    return mapping
+
+def is_normal_window(hwnd):
+    if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+        return False
+
+    ex = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+    style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+
+    if ex & win32con.WS_EX_TOOLWINDOW:
+        return False
+    if (style & win32con.WS_POPUP) and not (style & (win32con.WS_BORDER | win32con.WS_CAPTION)):
+        return False
+
+    title = win32gui.GetWindowText(hwnd).strip()
+    if not title:
+        return False
+
+    cls = win32gui.GetClassName(hwnd)
+    if "tooltip" in cls.lower():
+        return False
+
+    bad = {
+        "Windows.UI.Core.CoreWindow",
+        "ApplicationFrameWindow",
+        "IME", "Progman",
+        "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+        "Breadcrumb Parent Window",
+    }
+    if cls in bad:
+        return False
+
+    lower = cls.lower()
+    if any(substr in lower for substr in ("overlay", "experience", "inputtrap")):
+        return False
+
+    if title.lower() in ("settings", "windows input experience", "b＆o audio control"):
+        return False
+
+    return True
+
+def enum_windows():
+    wins = []
+    def cb(hwnd, _):
+        if is_normal_window(hwnd):
+            wins.append(hwnd)
+    win32gui.EnumWindows(cb, None)
+    return wins
+
+def get_monitors_workarea():
+    mons = []
+    def cb(hMon, hdc, rect_ptr, data):
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        user32.GetMonitorInfoW(hMon, ctypes.byref(mi))
+        r = mi.rcWork
+        mons.append((r.left, r.top, r.right, r.bottom))
+        return 1
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        ctypes.c_int, wintypes.HMONITOR, wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+    user32.EnumDisplayMonitors(0, 0, MonitorEnumProc(cb), 0)
+    return mons
+
+def ease_in_out(t):
+    if t < 0.5:
+        return 4 * t**3
+    return 1 - ((-2*t + 2)**3) / 2
+
+async def move_window_smooth(hwnd, x0, y0, x1, y1, w1, h1):
+    try:
+        old_rect = win32gui.GetWindowRect(hwnd)
+        ow = old_rect[2] - old_rect[0]
+        oh = old_rect[3] - old_rect[1]
+    except Exception:
+        return
+
+    for step in range(ANIMATION_STEPS + 1):
+        t = ease_in_out(step / ANIMATION_STEPS)
+        nx = int(x0 + (x1 - x0) * t)
+        ny = int(y0 + (y1 - y0) * t)
+        nw = int(ow + (w1 - ow) * t)
+        nh = int(oh + (h1 - oh) * t)
+        try:
+            win32gui.MoveWindow(hwnd, nx, ny, nw, nh, True)
+        except Exception:
+            break
+        await asyncio.sleep(ANIMATION_DURATION / ANIMATION_STEPS)
+
+class WindowManager:
+    def __init__(self):
+        self.last_rects = {}
+        self.moving = set()
+        self.order = {}
+        self.cfg_mtime = 0
+        self.cfg = {"mode": "master", "float": set()}
+        self.stable_counts = {}
+
+    def read_config(self):
+        try:
+            mtime = os.path.getmtime(CONFIG_FILE)
+            if mtime != self.cfg_mtime:
+                with open(CONFIG_FILE) as f:
+                    lines = f.readlines()
+                mode = "master"
+                floats = set()
+                for line in lines:
+                    if line.startswith("mode="):
+                        mode = line.split("=", 1)[1].strip()
+                    elif line.startswith("float="):
+                        parts = line.split("=", 1)[1].split(",")
+                        floats = {int(p) for p in parts if p.strip().isdigit()}
+                self.cfg = {"mode": mode, "float": floats}
+                self.cfg_mtime = mtime
+        except FileNotFoundError:
+            with open(CONFIG_FILE, "w") as f:
+                f.write("mode=master\nfloat=\n")
+            self.cfg = {"mode": "master", "float": set()}
+            self.cfg_mtime = time.time()
+        return self.cfg
+
+    def is_floating(self, hwnd):
+        return hwnd in self.cfg["float"]
+
+    def get_window_rect(self, hwnd):
+        try:
+            x1, y1, x2, y2 = win32gui.GetWindowRect(hwnd)
+            return (x1, y1, x2 - x1, y2 - y1)
+        except Exception:
+            return None
+
+    async def layout_hypr(self, wins, mon):
+        left, top, right, bottom = mon
+
+        def bsp_tile(windows, rect):
+            if not windows:
+                return []
+            x0, y0, x1, y1 = rect
+            w = x1 - x0
+            h = y1 - y0
+
+            if len(windows) == 1:
+                return [(windows[0], x0, y0, w, h)]
+
+            half = len(windows) // 2
+            if w >= h:
+                xm = x0 + w // 2
+                left_rect  = (x0, y0, xm, y1)
+                right_rect = (xm, y0, x1, y1)
+                left_wins  = windows[:half]
+                right_wins = windows[half:]
+                return bsp_tile(left_wins, left_rect) + bsp_tile(right_wins, right_rect)
+            else:
+                ym = y0 + h // 2
+                top_rect    = (x0, y0, x1, ym)
+                bottom_rect = (x0, ym, x1, y1)
+                top_wins    = windows[:half]
+                bot_wins    = windows[half:]
+                return bsp_tile(top_wins, top_rect) + bsp_tile(bot_wins, bottom_rect)
+
+        tiled = [hw for hw in wins if not self.is_floating(hw)]
+        if not tiled:
+            return
+
+        assignments = bsp_tile(tiled, (left + GAP, top + GAP, right - GAP, bottom - GAP))
+
+        tasks = []
+        for hwnd, nx, ny, nw, nh in assignments:
+            old = self.get_window_rect(hwnd)
+            if not old:
+                continue
+            ox, oy, ow, oh = old
+            apply_blur(hwnd)
+            tasks.append(move_window_smooth(hwnd, ox, oy, nx, ny, nw, nh))
+
+        await asyncio.gather(*tasks)
+        self.moving.clear()
+
+    async def layout_master(self, wins, mon):
+        left, top, right, bottom = mon
+        w = right - left - 2 * GAP
+        h = bottom - top - 2 * GAP
+        mr = 0.6
+
+        tiled = [w for w in wins if not self.is_floating(w)]
+        if not tiled:
+            return
+
+        tasks = []
+
+        if len(tiled) == 1:
+            rect = self.get_window_rect(tiled[0])
+            if rect:
+                x0, y0, _, _ = rect
+                apply_blur(tiled[0])
+                tasks.append(move_window_smooth(tiled[0], x0, y0, left + GAP, top + GAP, w, h))
+        else:
+            mw = int(w * mr)
+            sw = w - mw - GAP
+            slave_count = len(tiled) - 1
+            if slave_count > 0:
+                total_gap = GAP * (slave_count - 1)
+                sh = (h - total_gap) // slave_count
+            else:
+                sh = h
+
+            for i, hwnd in enumerate(tiled):
+                rect = self.get_window_rect(hwnd)
+                if not rect:
+                    continue
+                x0, y0, _, _ = rect
+                if i == 0:
+                    x1, y1, u1, v1 = left + GAP, top + GAP, mw, h
+                else:
+                    x1 = left + mw + 2 * GAP
+                    y1 = top + GAP + (i - 1) * (sh + GAP)
+                    u1, v1 = sw, sh
+                apply_blur(hwnd)
+                tasks.append(move_window_smooth(hwnd, x0, y0, x1, y1, u1, v1))
+
+        await asyncio.gather(*tasks)
+
+    async def partial_layout_master(self, windows, mon, resized_windows):
+
+        left, top, right, bottom = mon
+        w = right - left - 2 * GAP
+        h = bottom - top - 2 * GAP
+        mr = 0.6
+
+        tiled = [w for w in windows if not self.is_floating(w)]
+        if not tiled:
+            return
+
+        r_hwnd = resized_windows[0]
+        r_rect = self.get_window_rect(r_hwnd)
+        if not r_rect:
+            return
+
+        rx, ry, rw, rh = r_rect
+
+        tasks = []
+
+        apply_blur(r_hwnd)
+        #tasks.append(move_window_smooth(r_hwnd, rx, ry, rx, ry, rw, rh))
+
+        others = [hw for hw in tiled if hw != r_hwnd]
+        if not others:
+            await asyncio.gather(*tasks)
+            return
+
+        if windows.index(r_hwnd) == 0:
+            master_w = rw
+            slave_x = left + GAP + master_w + GAP
+            slave_w = right - GAP - slave_x
+            slave_count = len(others)
+            total_gap = GAP * (slave_count - 1)
+            slave_h = (h - total_gap) // slave_count
+            for i, hwnd in enumerate(others):
+                rect = self.get_window_rect(hwnd)
+                if not rect:
+                    continue
+                x0, y0, _, _ = rect
+                x1 = slave_x
+                y1 = top + GAP + i * (slave_h + GAP)
+                apply_blur(hwnd)
+                tasks.append(move_window_smooth(hwnd, x0, y0, x1, y1, slave_w, slave_h))
+        else:
+            master_hwnd = windows[0]
+            master_rect = self.get_window_rect(master_hwnd)
+            if not master_rect:
+                await asyncio.gather(*tasks)
+                return
+            mx, my, mw, mh = master_rect
+
+            slaves = [hw for hw in others]
+            slaves.remove(r_hwnd)
+            if not slaves:
+                apply_blur(master_hwnd)
+                tasks.append(move_window_smooth(master_hwnd, mx, my, left + GAP, top + GAP, int(w * mr), h))
+                await asyncio.gather(*tasks)
+                return
+
+            slave_x = left + GAP + mw + GAP
+            slave_w = right - GAP - slave_x
+
+            total_gap = GAP * (len(slaves))
+            total_height = h - total_gap
+
+            rem_height = total_height - rh
+            if rem_height < 0:
+                rem_height = 0
+
+            each_h = rem_height // len(slaves)
+
+            apply_blur(master_hwnd)
+            tasks.append(move_window_smooth(master_hwnd, mx, my, left + GAP, top + GAP, mw, h))
+
+            apply_blur(r_hwnd)
+            #tasks.append(move_window_smooth(r_hwnd, rx, ry, rx, ry, rw, rh))
+
+            current_y = top + GAP
+            for hwnd in slaves:
+                rect = self.get_window_rect(hwnd)
+                if not rect:
+                    continue
+                x0, y0, _, _ = rect
+                x1 = slave_x
+                y1 = current_y
+                apply_blur(hwnd)
+                tasks.append(move_window_smooth(hwnd, x0, y0, x1, y1, slave_w, each_h))
+                current_y += each_h + GAP
+
+        await asyncio.gather(*tasks)
+
+    async def layout_square(self, wins, mon):
+        left, top, right, bottom = mon
+        w = right - left - 2 * GAP
+        h = bottom - top - 2 * GAP
+
+        tiled = [w for w in wins if not self.is_floating(w)]
+        c = len(tiled)
+        if c == 0:
+            return
+
+        ratio = w / h
+        cols = max(1, int((c * ratio) ** 0.5))
+        rows = (c + cols - 1) // cols
+        cw, ch = w // cols, h // rows
+
+        tasks = []
+
+        for i, hwnd in enumerate(tiled):
+            rect = self.get_window_rect(hwnd)
+            if not rect:
+                continue
+            x0, y0, _, _ = rect
+            col, row = i % cols, i // cols
+            x1 = left + GAP + col * cw
+            y1 = top + GAP + row * ch
+            apply_blur(hwnd)
+            tasks.append(move_window_smooth(hwnd, x0, y0, x1, y1, cw - GAP, ch - GAP))
+
+        await asyncio.gather(*tasks)
+
+    async def run(self):
+        while True:
+            self.read_config()
+
+            wins = enum_windows()
+            mons = get_monitors_workarea()
+
+            new_moving = set()
+            for h in wins:
+                old_rect = self.last_rects.get(h)
+                try:
+                    cur_rect = win32gui.GetWindowRect(h)
+                except Exception:
+                    continue
+
+                if old_rect and cur_rect != old_rect:
+                    new_moving.add(h)
+                self.last_rects[h] = cur_rect
+
+            resized_windows = set()
+            for h in new_moving:
+                old_rect = self.last_rects.get(h)
+                try:
+                    cur_rect = win32gui.GetWindowRect(h)
+                except Exception:
+                    continue
+                if old_rect:
+                    old_w = old_rect[2] - old_rect[0]
+                    old_h = old_rect[3] - old_rect[1]
+                    new_w = cur_rect[2] - cur_rect[0]
+                    new_h = cur_rect[3] - cur_rect[1]
+                    if abs(new_w - old_w) > 5 or abs(new_h - old_h) > 5:
+                        resized_windows.add(h)
+
+            dropped = self.moving - new_moving
+            self.moving = new_moving
+
+            if self.moving:
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+
+            wm_map = window_monitor_map(wins, mons)
+            tasks = []
+
+            for mi, mon in enumerate(mons):
+                visible = [h for h in wm_map.get(mi, []) if not self.is_floating(h)]
+
+                if mi not in self.order:
+                    self.order[mi] = list(visible)
+
+                self.order[mi] = [h for h in self.order[mi] if h in visible]
+                for h in visible:
+                    if h not in self.order[mi]:
+                        self.order[mi].append(h)
+
+                for h in dropped:
+                    if h not in self.order[mi]:
+                        continue
+                    rect_h = self.get_window_rect(h)
+                    if not rect_h:
+                        continue
+                    idx_h = self.order[mi].index(h)
+                    for j, other in enumerate(self.order[mi]):
+                        if other == h:
+                            continue
+                        rect_o = self.get_window_rect(other)
+                        if rect_o and rects_intersect(rect_h, rect_o):
+                            self.order[mi][idx_h], self.order[mi][j] = self.order[mi][j], self.order[mi][idx_h]
+                            break
+
+                mode = self.cfg["mode"]
+                if mode == "hyprland":
+                    tasks.append(self.layout_hypr(self.order[mi], mon))
+                elif mode == "square":
+                    tasks.append(self.layout_square(self.order[mi], mon))
+                else:
+                    tasks.append(self.layout_master(self.order[mi], mon))
+
+            await asyncio.gather(*tasks)
+
+            await asyncio.sleep(POLL_INTERVAL)
+
+async def toggle_focused_window_floating_async(wm):
+    hwnd = win32gui.GetForegroundWindow()
+    if not hwnd:
+        return
+    cfg = wm.cfg
+    floats = cfg["float"].copy()
+    if hwnd in floats:
+        floats.remove(hwnd)
+    else:
+        floats.add(hwnd)
+
+    with open(CONFIG_FILE, "w") as f:
+        f.write(f"mode={cfg['mode']}\n")
+        f.write("float=" + ",".join(str(f) for f in floats) + "\n")
+
+    wm.cfg["float"] = floats
+
+async def hotkey_listener(wm):
+    loop = asyncio.get_running_loop()
+
+    def on_toggle():
+        asyncio.run_coroutine_threadsafe(toggle_focused_window_floating_async(wm), loop)
+
+    keyboard.add_hotkey("windows+enter", on_toggle)
+    while True:
+        await asyncio.sleep(1)
+
+async def main():
+    wm = WindowManager()
+    await asyncio.gather(wm.run(), hotkey_listener(wm))
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
